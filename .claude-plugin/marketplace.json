@@ -1,0 +1,15 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "obliscence-local",
+  "description": "The local marketplace for obliscence.",
+  "owner": { "name": "emma x lirette (imagistex)" },
+  "plugins": [
+    {
+      "name": "obliscence",
+      "source": "./",
+      "version": "0.1.0",
+      "description": "The process and the empty vessels of a memory architecture.",
+      "category": "productivity"
+    }
+  ]
+}

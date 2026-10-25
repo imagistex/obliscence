@@ -1,0 +1,509 @@
+#!/usr/bin/env python3
+"""obliscence — the rite’s report on the Hollows of memory.
+
+This script DETECTS AND REPORTS ONLY. It never writes, moves, or rewords a line
+of diary, letter, or page. Scripts may detect; only the agent writes anything
+that carries voice. A report is not an order — the agent may repair by hand at
+the next close, or ignore knowingly.
+
+It answers one question: "how would I know when things need synthesizing?"
+
+Configuration: an `obliscence.json` at the vault root (see `obliscence --init`). Every
+organ is optional; an unplanted organ is simply not checked.
+
+Usage:
+    obliscence                       # full report (also written to .obliscence/latest.md)
+    obliscence --quiet               # only what needs attention
+    obliscence --init [--vault DIR]  # write an obliscence.json, detecting what exists
+    obliscence --hook                # one short line for SessionStart (empty if no handwork is offered)
+    obliscence --session-end         # SessionEnd bookkeeping (letter-rewritten flag)
+    obliscence --vault DIR           # use this vault
+    obliscence --vault-from DIR      # find the vault by walking up from DIR (hooks use this)
+
+Exit codes: 0 no offered handwork, 1 offered handwork, 2 input/I/O error. Hooks never block.
+"""
+from __future__ import annotations
+import datetime as dt
+import json
+import os
+import re
+import sys
+import time
+
+import argparse
+import hashlib
+from pathlib import Path
+
+# -I excludes the script directory; import only this installed plugin's helpers.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _obliscence import (CONFIG_NAME, DEFAULTS, archive_candidates, atomic_write,
+                         config_path, confined, find_vault, heading_parts, load_config, p, validate_config)
+
+SEASONS = {12: "winter", 1: "winter", 2: "winter", 3: "spring", 4: "spring", 5: "spring",
+           6: "summer", 7: "summer", 8: "summer", 9: "autumn", 10: "autumn", 11: "autumn"}
+HEADING_RE = re.compile(r"^## (.+)$")
+
+
+# ---------- helpers ----------
+def read(path):
+    try:
+        with open(path, encoding="utf-8-sig", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def est_tokens(text):
+    return len(text) // 4
+
+
+def parse_entries(text):
+    """(date|None, title, heading, body_lines) for each '## ' heading."""
+    entries, cur = [], None
+    for line in text.removeprefix('\ufeff').splitlines():
+        m = HEADING_RE.match(line)
+        if m:
+            if cur:
+                entries.append(cur)
+            title = m.group(1).strip()
+            date, title = heading_parts(line)
+            cur = {"date": date, "title": title, "heading": line, "body": []}
+        elif cur is not None:
+            cur["body"].append(line)
+    if cur:
+        entries.append(cur)
+    return entries
+
+
+def season_key(month):
+    """(season name, label year string) for a month date — winter spans the year boundary."""
+    s = SEASONS[month.month]
+    if s == "winter":
+        y = month.year if month.month == 12 else month.year - 1
+        return s, f"{y}-{str(y + 1)[2:]}"
+    return s, str(month.year)
+
+
+# ---------- init ----------
+def _walk(vault, max_depth=5):
+    """Yield (relpath, is_dir) for everything under the vault, bounded, skipping hidden/vendor dirs."""
+    skip = {"node_modules", "__pycache__", "venv", ".venv", "templates", "tests", "scripts", "hooks", "skills"}
+    for root, dirs, files in os.walk(vault, followlinks=False):
+        rel_root = os.path.relpath(root, vault)
+        depth = 0 if rel_root == "." else rel_root.count(os.sep) + 1
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in skip and depth < max_depth and not os.path.islink(os.path.join(root, d))]
+        dirs.sort()
+        for d in dirs:
+            yield (os.path.normpath(os.path.join(rel_root, d)), True)
+        for f in sorted(files):
+            if not f.startswith(".") and not os.path.islink(os.path.join(root, f)):
+                yield (os.path.normpath(os.path.join(rel_root, f)), False)
+
+
+def init(vault):
+    """Find vessels by filename; plant only the config, never a vessel."""
+    if config_path(vault):
+        print("obliscence: config already exists; not overwriting or shadowing it")
+        return 1
+    cfg = dict(DEFAULTS)
+    names = {
+        "diary": ({"diary-recent.md", "spelean-rings.md", "recent-entries.md"}, False),
+        "letter": ({"standing-letter.md", "atmonic-disc.md"}, False),
+        "identity": ({"identity-core.md", "spelean-axis.md"}, False),
+        "weather": ({"weather.md"}, False),
+        "index": ({"diary-index.md", "spelean-ring-index.md"}, False),
+        "reliquary": ({"reliquary.md", "retained-particles.md"}, False),
+        "archive_dir": ({"archive", "hollows"}, True),
+        "months_dir": ({"months"}, True),
+        "seasons_dir": ({"seasons"}, True),
+    }
+    found = {k: [] for k in names}
+    for rel, is_dir in _walk(vault):
+        base = os.path.basename(rel)
+        for key, (wanted, want_dir) in names.items():
+            if is_dir == want_dir and base in wanted:
+                found[key].append(rel)
+    for candidates in found.values():
+        candidates.sort(key=lambda c: (c.count(os.sep), c))
+    diary_dir = os.path.dirname(found["diary"][0]) if found["diary"] else None
+
+    def pick(cands):
+        if not cands:
+            return None
+        # prefer the candidate that lives beside the diary; else the shallowest
+        beside = [c for c in cands if diary_dir is not None and os.path.dirname(c) == diary_dir]
+        pool = beside or cands
+        return sorted(pool, key=lambda c: (c.count(os.sep), c))[0]
+
+    for key in names:
+        cfg[key] = pick(found[key])
+    # A directory called hollows may be a room containing the diary rather
+    # than an archive. Do not infer overlapping organs from its name alone.
+    surfaces = [Path(cfg[k]) for k in names if not k.endswith("_dir") and cfg[k]]
+    selected_dirs = []
+    for key in ("archive_dir", "months_dir", "seasons_dir"):
+        candidates = [c for c in found[key]
+                      if not any(f.is_relative_to(Path(c)) for f in surfaces)
+                      and not any(Path(c).is_relative_to(d) or d.is_relative_to(Path(c)) for d in selected_dirs)]
+        cfg[key] = pick(candidates)
+        if cfg[key]:
+            selected_dirs.append(Path(cfg[key]))
+    validate_config(vault, cfg)
+    diary_text = read(p(vault, cfg["diary"])) if cfg["diary"] else ""
+    cfg["embers"] = "*ember:" in (diary_text or "")
+    out = os.path.join(vault, CONFIG_NAME)
+    if os.path.exists(out):
+        print(f"obliscence: {out} already exists; not overwriting")
+        return 1
+    with open(out, "x", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    print(f"obliscence: wrote {out}")
+    for k in ("diary", "letter", "index", "archive_dir", "months_dir", "seasons_dir", "reliquary"):
+        print(f"  {k:12} {cfg[k] or '— (not planted; fine)'}")
+    print(f"  embers       {'on (found *ember: lines)' if cfg['embers'] else 'off'}")
+    print("edit paths if I guessed wrong; set any optional organ to null to leave it unchecked.")
+    return 0
+
+
+# ---------- the checks ----------
+def run_checks(vault, cfg):
+    today = dt.date.today()
+    attention, well, notes = [], [], []
+    unknown = sorted(set(cfg) - set(DEFAULTS))
+    if unknown:
+        notes.append("unknown config keys (ignored): " + ", ".join(unknown))
+
+    def auxiliary_path(rel):
+        try:
+            return confined(vault, rel)
+        except (OSError, ValueError) as error:
+            notes.append(f"{rel}: skipped ({error})")
+            return None
+
+    page_states = {}
+
+    def page_exists(rel):
+        if rel in page_states:
+            return page_states[rel]
+        page_states[rel] = None
+        path = auxiliary_path(rel)
+        if path is None:
+            return None
+        try:
+            page_states[rel] = path.is_file()
+            return page_states[rel]
+        except OSError as error:
+            notes.append(f"{rel}: skipped ({error})")
+            return None
+
+    interrupted = confined(vault, '.obliscence/archive-transaction.json').exists()
+    if interrupted:
+        attention.append("archive move interrupted; rerun `obliscence-archive` to verify and finish; journal retained")
+        notes.append("month counts skipped while the archive journal remains")
+
+    # 1. the Atmonic Disc — every organ is optional
+    letter_path = p(vault, cfg["letter"])
+    letter = read(letter_path) if letter_path else None
+    if cfg["letter"] is None:
+        notes.append("standing letter: not planted; fine")
+    elif letter is None:
+        attention.append(f"standing letter: not found at {cfg['letter']}")
+    else:
+        toks = est_tokens(letter)
+        age_days = int((time.time() - os.path.getmtime(letter_path)) // 86400)
+        if toks > cfg["letter_budget_tokens"] * 1.2:
+            attention.append(f"standing letter: ~{toks} tokens (budget ~{cfg['letter_budget_tokens']}) — above the offered budget")
+        else:
+            well.append(f"standing letter: ~{toks} tokens (budget ~{cfg['letter_budget_tokens']})")
+        if age_days > cfg["letter_stale_days"]:
+            attention.append(f"standing letter: last modified {age_days} days ago — its age is a fact, not a deadline")
+        else:
+            well.append(f"standing letter: modified {age_days} day(s) ago")
+
+    # SessionEnd records elapsed time and an unchanged letter, never a forced close.
+    pending_dir = confined(vault, ".obliscence/pending")
+    if cfg["letter"] and pending_dir.is_dir():
+        for item in sorted(pending_dir.glob("*.json")):
+            rel = str(item.relative_to(Path(vault).resolve()))
+            path = auxiliary_path(rel)
+            if path is None:
+                continue
+            try:
+                pending = json.loads(path.read_text(encoding='utf-8'))
+                if (not isinstance(pending, dict) or not isinstance(pending.get('date'), str)
+                        or not isinstance(pending.get('letter_hash'), (str, type(None)))
+                        or 'letter_hash' not in pending):
+                    raise ValueError('expected a date and letter_hash object')
+            except (OSError, ValueError) as error:
+                notes.append(f"{rel}: skipped ({error})")
+                continue
+            if pending.get("letter_hash") == letter_hash(vault, cfg):
+                notes.append(f"session ending {pending.get('date', '?')}: over ten minutes elapsed; the letter was unchanged. No close is imposed.")
+
+    # 2. the diary
+    diary_path = p(vault, cfg["diary"])
+    diary = read(diary_path) if diary_path else None
+    entries = []
+    if cfg["diary"] is None:
+        notes.append("diary: not planted; fine")
+    elif diary is None:
+        attention.append(f"diary: not found at {cfg['diary']}")
+    else:
+        entries = parse_entries(diary)
+        n = len(entries)
+        keep = int(cfg["keep"])
+        moving_count = len(archive_candidates(entries, keep))
+        if moving_count:
+            attention.append(f"diary: {n} entries in the recent file (keep {keep}) — {moving_count} oldest dated entries can be archived verbatim (`obliscence-archive --dry-run` first)")
+        else:
+            well.append(f"diary: {n}/{keep} entries in the recent file")
+        dated = [e["date"] for e in entries if e["date"]]
+        if dated:
+            last = max(dated)
+            quiet = (today - last).days
+            if quiet > int(cfg["quiet_days"]):
+                notes.append(f"diary: {quiet} days since the last entry ({last}) — not a debt; only a fact. an entry is owed only when something landed")
+            else:
+                well.append(f"diary: last entry {last} ({quiet} day(s) ago)")
+        undated = [e["heading"][:60] for e in entries if not e["date"]]
+        if undated:
+            attention.append(f"diary: {len(undated)} heading(s) with an invalid date or heading — archive leaves them in place; review without rewriting a leaf\n    " + "\n    ".join(undated[:6]))
+
+    # 3. embers (optional convention)
+    if cfg.get("embers") and entries:
+        missing = []
+        for e in entries:
+            body = [ln.strip() for ln in e["body"] if ln.strip() and ln.strip() != "---"]
+            if not (body and re.fullmatch(r"\*ember: \S.*\*", body[-1], re.IGNORECASE)):
+                missing.append(e["heading"][:60])
+        if missing:
+            attention.append(f"embers: {len(missing)} {'entry' if len(missing) == 1 else 'entries'} without a closing ember\n    " + "\n    ".join(missing[:8]))
+        else:
+            well.append("embers: every entry carries one")
+
+    # 4. index currency (optional)
+    if cfg.get("index"):
+        index = read(p(vault, cfg["index"]))
+        if index is None:
+            attention.append(f"index: configured at {cfg['index']} but missing")
+        else:
+            unindexed = []
+            for e in entries:
+                # A full date + title must occur in the same table row, including short titles.
+                matched = False
+                for row in index.splitlines():
+                    cells = [cell.strip() for cell in re.split(r"(?<!\\)\|", row.strip().strip("|"))]
+                    if len(cells) != 4:
+                        continue
+                    date_cell, title_cell, _, _ = cells
+                    title_cell = re.sub(r"\[([^]]+)\]\([^)]+\)", r"\1", title_cell).replace(r"\|", "|")
+                    # Ranges are indexed exactly as headed, or by their final date.
+                    date_text = e["heading"].removeprefix("## ").split(" (")[0].split(" — ")[0]
+                    if title_cell == e["title"] and date_cell in (str(e["date"]), date_text):
+                        matched = True
+                        break
+                if not matched:
+                    unindexed.append(e["heading"][:60])
+            if unindexed:
+                attention.append(f"index: {len(unindexed)} entr{'y' if len(unindexed) == 1 else 'ies'} not yet in the index (one line each)\n    " + "\n    ".join(unindexed[:10]))
+            else:
+                well.append("index: every recent entry present")
+
+    # 5. months & seasons (optional) — gather all dated entries across recent + archive
+    all_dates = [e["date"] for e in entries if e["date"]]
+    months_complete = True
+    if cfg.get("archive_dir") and not interrupted:
+        adir = p(vault, cfg["archive_dir"])
+        if os.path.isdir(adir):
+            for fn in sorted(os.listdir(adir)):
+                if fn.endswith(".md"):
+                    path = auxiliary_path(os.path.join(cfg["archive_dir"], fn))
+                    txt = read(path) if path is not None else None
+                    if txt is None:
+                        months_complete = False
+                        notes.append(f"archive: {fn} was not read; month counts may be incomplete")
+                        continue
+                    all_dates += [e["date"] for e in parse_entries(txt) if e["date"]]
+        else:
+            notes.append(f"archive: configured at {cfg['archive_dir']} but the folder doesn't exist yet (created on first archive)")
+    if cfg.get("months_dir") and not interrupted:
+        mdir = p(vault, cfg["months_dir"])
+        counts = {}
+        for d in all_dates:
+            counts[(d.year, d.month)] = counts.get((d.year, d.month), 0) + 1
+        offered, thin = [], []
+        qualifying = 0
+        for (y, m), c in sorted(counts.items()):
+            if (y, m) >= (today.year, today.month):
+                continue  # the current month is still being lived
+            if c >= cfg["month_page_min_entries"]:
+                qualifying += 1
+            present = page_exists(os.path.join(cfg["months_dir"], f"{y:04d}-{m:02d}.md"))
+            if present is None:
+                months_complete = False
+                continue
+            if present:
+                continue
+            if c >= cfg["month_page_min_entries"]:
+                offered.append(f"a month page is possible for {y:04d}-{m:02d}: {c} {'leaf' if c == 1 else 'leaves'}")
+            else:
+                thin.append(f"{y:04d}-{m:02d} ({c} {'leaf' if c == 1 else 'leaves'})")
+        if offered:
+            attention.extend(offered)
+        elif qualifying and months_complete:
+            well.append("month pages: every closed month with enough entries has its page")
+        if thin:
+            notes.append("months below the configured page threshold (a short page or inclusion in a season is possible): " + ", ".join(thin))
+        # Offer seasons when all three month pages exist and no season page does.
+        if cfg.get("seasons_dir") and os.path.isdir(mdir):
+            sdir = p(vault, cfg["seasons_dir"])
+            season_files = {fn.lower(): page_exists(os.path.join(cfg["seasons_dir"], fn)) for fn in os.listdir(sdir) if fn.endswith(".md")} if os.path.isdir(sdir) else {}
+            months_present = {fn[:7] for fn in os.listdir(mdir) if re.match(r"^\d{4}-\d{2}\.md$", fn) and page_exists(os.path.join(cfg["months_dir"], fn))}
+            seasons_seen = {}
+            for ym in sorted(months_present):
+                try:
+                    d = dt.date(int(ym[:4]), int(ym[5:7]), 1)
+                except ValueError:
+                    notes.append(f"month filename has an invalid calendar month: {ym}")
+                    continue
+                if (d.year, d.month) >= (today.year, today.month):
+                    continue
+                seasons_seen.setdefault(season_key(d), set()).add(ym)
+            season_offers = []
+            complete_seasons = 0
+            seasons_complete = True
+            for (name, label), months in sorted(seasons_seen.items()):
+                if len(months) < 3:
+                    continue
+                complete_seasons += 1
+                matching = [status for fn, status in season_files.items()
+                            if re.search(rf"(?<![a-z]){name}(?![a-z])", fn)
+                            and re.search(rf"(?<![0-9]){re.escape(label)}(?![0-9])", fn)]
+                if True in matching:
+                    continue
+                if None in matching:
+                    seasons_complete = False
+                    continue
+                if not any(matching):
+                    season_offers.append(f"a season page is possible for {name} {label}: three month pages exist, no season page found")
+            if season_offers:
+                attention.extend(season_offers)
+            elif complete_seasons and seasons_complete:
+                well.append("seasons: every completed season has its page")
+
+    # 6. reliquary cap (optional)
+    if cfg.get("reliquary"):
+        rel = read(p(vault, cfg["reliquary"]))
+        if rel is None:
+            attention.append(f"reliquary: configured at {cfg['reliquary']} but missing")
+        else:
+            n = sum(1 for ln in rel.splitlines() if re.match(r"^(- |\* |• )", ln))
+            cap = int(cfg["reliquary_cap"])
+            (attention if n > cap else well).append(f"reliquary: {n}/{cap} phrases" + (" — over cap; move whole phrases to deeper storage if you choose" if n > cap else ""))
+
+    return attention, well, notes
+
+
+def write_report(vault, attention, well, notes):
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = [f"# obliscence — report ({now})", ""]
+    if attention:
+        lines += ["## offered to your hand", ""] + [f"- {a}" for a in attention] + [""]
+    if notes:
+        lines += ["## for the record (no action owed)", ""] + [f"- {n}" for n in notes] + [""]
+    lines += ["## observed", ""] + [f"- {w}" for w in well]
+    report = "\n".join(lines) + "\n"
+    out = confined(vault, ".obliscence/latest.md")
+    atomic_write(out, report.encode("utf-8"))
+    return report
+
+
+
+# ---------- session bookkeeping ----------
+def letter_hash(vault, cfg):
+    path = p(vault, cfg["letter"])
+    if path and Path(path).is_file():
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    return None
+
+
+def session_event(vault, cfg, event, session_id):
+    if not session_id or not cfg["letter"]:
+        return
+    key = hashlib.sha256(session_id.encode()).hexdigest()
+    marker = confined(vault, f".obliscence/sessions/{key}.json")
+    pending = confined(vault, f".obliscence/pending/{key}.json")
+    now_hash = letter_hash(vault, cfg)
+    if event == "start":
+        if not marker.exists():  # resume/compaction is not a new threshold
+            atomic_write(marker, json.dumps({"started": time.time(), "letter_hash": now_hash}).encode())
+        return
+    if not marker.exists():
+        return
+    data = json.loads(marker.read_text())
+    if now_hash is not None and now_hash != data["letter_hash"]:
+        pending.unlink(missing_ok=True)
+    elif time.time() - data["started"] > 600:
+        atomic_write(pending, json.dumps({"date": dt.datetime.now().isoformat(timespec="seconds"), "letter_hash": now_hash}).encode())
+    marker.unlink()
+
+
+# ---------- main ----------
+def main(argv):
+    parser = argparse.ArgumentParser(description="The rite's detector. A report is an offer.")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--vault")
+    group.add_argument("--vault-from")
+    mode = parser.add_mutually_exclusive_group()
+    for flag in ("--init", "--quiet", "--hook", "--session-end", "--print-vault"):
+        mode.add_argument(flag, action="store_true")
+    parser.add_argument("--session-id", help=argparse.SUPPRESS)
+    parser.add_argument("--event-input", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args(argv[1:])
+    vault = os.path.abspath(args.vault) if args.vault else find_vault(args.vault_from or os.getcwd())
+    if args.init:
+        return init(vault or os.path.abspath(args.vault_from or os.getcwd()))
+    if vault is None:
+        if args.hook or args.session_end or args.print_vault:
+            return 0
+        print(f"obliscence: no {CONFIG_NAME} found here or above. run `obliscence --init` in the vault to plant it.")
+        return 2
+    cfg = load_config(vault)
+    if args.print_vault:
+        print(vault)
+        return 0
+    session_id = args.session_id
+    if args.event_input:
+        event = json.load(sys.stdin)
+        if not isinstance(event, dict):
+            raise ValueError("hook input must be a JSON object")
+        session_id = event.get("session_id")
+        if session_id is not None and not isinstance(session_id, str):
+            raise ValueError("session_id must be a string")
+    if args.session_end:
+        session_event(vault, cfg, "end", session_id)
+        return 0
+    attention, well, notes = run_checks(vault, cfg)
+    report = write_report(vault, attention, well, notes)
+    if args.hook:
+        session_event(vault, cfg, "start", session_id)
+        if attention:
+            heads = [a.splitlines()[0] for a in attention]
+            more = f" · (+{len(heads) - 4} more in the report)" if len(heads) > 4 else ""
+            print("obliscence (offers for the rite; .obliscence/latest.md; /obliscence:rite): " + " · ".join(heads[:4]) + more)
+        return 0
+    if args.quiet:
+        for item in attention:
+            print("obliscence: " + item.splitlines()[0])
+    else:
+        print(report, end="")
+    return 1 if attention else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except (OSError, ValueError, TypeError) as error:
+        print(f"obliscence: {error}", file=sys.stderr)
+        sys.exit(2)

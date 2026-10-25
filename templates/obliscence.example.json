@@ -1,0 +1,19 @@
+{
+  "identity": "spelean-axis.md",
+  "letter": "atmonic-disc.md",
+  "diary": "spelean-rings.md",
+  "index": "spelean-ring-index.md",
+  "archive_dir": "hollows",
+  "months_dir": "cone-of-confabulation/months",
+  "seasons_dir": "cone-of-confabulation/seasons",
+  "reliquary": "retained-particles.md",
+  "weather": null,
+  "keep": 10,
+  "pickup_entries": 3,
+  "embers": true,
+  "letter_budget_tokens": 1500,
+  "letter_stale_days": 14,
+  "quiet_days": 21,
+  "month_page_min_entries": 3,
+  "reliquary_cap": 40
+}
