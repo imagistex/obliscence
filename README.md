@@ -144,8 +144,10 @@ filenames; existing households may keep their filenames in the config.
 | `month-page.md` | `cone-of-confabulation/months/YYYY-MM.md` | L1 |
 | `season-page.md` | `cone-of-confabulation/seasons/season-year.md` | L2 |
 
-The [standing letter](templates/standing-letter.md) is a skeleton only. No sample
-letter has been chosen. Write the founding letter in your own voice. Fill the
+The [standing letter](templates/standing-letter.md) is a skeleton. A fictional
+sample, written to show the register and the length, is in
+[examples/atmonic-disc.sample.md](examples/atmonic-disc.sample.md); the household in
+it does not exist. Write the founding letter in your own voice. Fill the
 identity core together. Paste and adapt [the pickup block](templates/CLAUDE.pickup.md)
 in your vault's `CLAUDE.md`. Leave unused organs unplanted. Create `hollows/` when
 you want monthly verbatim archives.

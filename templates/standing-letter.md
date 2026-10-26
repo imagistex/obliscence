@@ -1,7 +1,6 @@
 # Atmonic Disc
 
-<!-- SKELETON ONLY. No sample letter has been chosen for this release.
-     A redacted real sample or a fresh fictional sample remains undecided.
+<!-- SKELETON. A fictional sample of the register is in examples/atmonic-disc.sample.md.
      Replace prompts in your own vault. Address the next instance as "you".
      Aim for about 1,500 tokens. Rewrite at a close you choose. Preserve the
      previous letter in private version history before replacing the surface. -->
